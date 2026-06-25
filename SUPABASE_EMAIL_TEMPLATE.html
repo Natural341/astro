@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Kosmos Astro Password Reset</title>
+</head>
+<body style="margin: 0; padding: 0; background-color: #f4f4f5; font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif;">
+  
+  <div style="background-color: #f4f4f5; padding: 40px 20px;">
+    <div style="max-width: 550px; margin: 0 auto; background-color: #ffffff; border-radius: 24px; overflow: hidden; box-shadow: 0 10px 40px rgba(0,0,0,0.08);">
+      
+      <!-- HEADER / LOGO -->
+      <div style="background: linear-gradient(135deg, #9D4EDD 0%, #7C3AED 100%); padding: 45px 30px; text-align: center;">
+        <h1 style="color: #ffffff; margin: 0; font-size: 26px; font-weight: 800; letter-spacing: 4px; text-transform: uppercase;">KOSMOS ASTRO</h1>
+        <p style="color: rgba(255,255,255,0.85); font-size: 13px; margin-top: 8px; font-weight: 500; letter-spacing: 1px;">MYSTIC JOURNEY</p>
+      </div>
+
+      <!-- CONTENT AREA -->
+      <div style="padding: 40px 30px; text-align: center;">
+        
+        <!-- TURKISH SECTION -->
+        <h2 style="color: #18181b; font-size: 20px; margin: 0 0 12px 0; font-weight: 700;">Şifrenizi mi unuttunuz?</h2>
+        <p style="color: #52525b; font-size: 15px; line-height: 1.6; margin: 0 0 24px 0;">
+          Yeni şifrenizi belirlemek ve hesabınızı doğrulamak için aşağıdaki kodu kullanın.
+        </p>
+
+        <!-- THE CODE (CENTERPIECE) -->
+        <div style="background-color: #F3E8FF; border: 2px dashed #D8B4FE; border-radius: 16px; padding: 20px; margin: 30px 0;">
+          <span style="font-family: monospace; font-size: 38px; font-weight: 800; color: #7C3AED; letter-spacing: 8px; display: block; line-height: 1;">{{ .Token }}</span>
+        </div>
+
+        <!-- ENGLISH SECTION -->
+        <div style="margin-top: 30px; padding-top: 30px; border-top: 1px solid #e4e4e7;">
+          <h3 style="color: #27272a; font-size: 16px; margin: 0 0 8px 0; font-weight: 600;">Reset your password</h3>
+          <p style="color: #71717a; font-size: 14px; line-height: 1.5; margin: 0;">
+            Use the verification code above to set a new password for your account.
+          </p>
+        </div>
+
+      </div>
+
+      <!-- FOOTER -->
+      <div style="background-color: #fafafa; padding: 24px; text-align: center; border-top: 1px solid #f4f4f5;">
+        <p style="color: #d4d4d8; font-size: 11px; margin: 0; line-height: 1.6;">
+          Bu kod 10 dakika süreyle geçerlidir.<br>
+          This code is valid for 10 minutes.
+        </p>
+      </div>
+
+    </div>
+    
+    <!-- BRANDING FOOTER -->
+    <div style="text-align: center; margin-top: 24px;">
+      <p style="color: #a1a1aa; font-size: 12px; margin: 0;">&copy; 2026 Kosmos Astro App</p>
+    </div>
+  </div>
+
+</body>
+</html>
