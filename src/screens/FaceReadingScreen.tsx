@@ -19,7 +19,7 @@ import { ArrowCircleLeftIcon } from '../components/icons';
 import * as Haptics from 'expo-haptics';
 import * as ImagePicker from 'expo-image-picker';
 import Svg, { Ellipse, Circle } from 'react-native-svg';
-import { detectSubject } from '../services/imageDetection';
+import { detectSubject, FaceGeometry, Point } from '../services/imageDetection';
 import { useNavigation, useFocusEffect } from '@react-navigation/native';
 
 import { useStore } from '../store/useStore';
@@ -39,6 +39,7 @@ interface FaceRegion {
   label: string;
   icon: string;
   description: string;
+  /** Fallback position (used only when real face geometry isn't available — e.g. Expo Go). */
   dotPosition: { top: string; left: string };
 }
 
@@ -86,6 +87,70 @@ const FACE_REGIONS: FaceRegion[] = [
     dotPosition: { top: '68%', left: '28%' },
   },
 ];
+
+// ─── Derive real region points from ML Kit face geometry ───────────────────
+// ML Kit only detects a fixed set of landmarks (eyes/nose/mouth/ears/cheeks) —
+// there's no direct "forehead" or "chin" landmark, so those are approximated
+// from the detected eye/mouth positions and the face contour, using real
+// proportions of *this* face rather than fixed percentages.
+const deriveRegionPoints = (geo: FaceGeometry): Partial<Record<string, Point>> => {
+  const { landmarks: lm, frame, faceContour } = geo;
+  const points: Partial<Record<string, Point>> = {};
+
+  const leftEye = lm.leftEye;
+  const rightEye = lm.rightEye;
+  const eyeMid: Point | undefined = leftEye && rightEye
+    ? { x: (leftEye.x + rightEye.x) / 2, y: (leftEye.y + rightEye.y) / 2 }
+    : leftEye ?? rightEye;
+
+  if (eyeMid) points.eyes = eyeMid;
+  if (lm.noseBase) points.nose = lm.noseBase;
+
+  const mouthPts = [lm.mouthLeft, lm.mouthRight, lm.mouthBottom].filter(Boolean) as Point[];
+  if (mouthPts.length) {
+    points.mouth = {
+      x: mouthPts.reduce((s, p) => s + p.x, 0) / mouthPts.length,
+      y: (lm.mouthBottom ?? mouthPts[0]).y,
+    };
+  }
+
+  // Forehead: no ML Kit landmark for it — interpolate up from the eyes toward
+  // the top of the detected face box, using this face's own proportions.
+  if (eyeMid && frame.height > 0) {
+    points.forehead = { x: eyeMid.x, y: frame.top + (eyeMid.y - frame.top) * 0.4 };
+  }
+
+  if (faceContour.length > 4) {
+    const centerX = eyeMid?.x ?? frame.left + frame.width / 2;
+    // Chin: lowest contour point near the face's vertical centerline.
+    const nearCenter = faceContour.filter((p) => Math.abs(p.x - centerX) < frame.width * 0.25);
+    const pool = nearCenter.length ? nearCenter : faceContour;
+    points.chin = pool.reduce((best, p) => (p.y > best.y ? p : best), pool[0]);
+
+    // Jawline: contour point on the left side of the face at chin-to-eye height.
+    const jawY = points.chin ? (points.chin.y + (eyeMid?.y ?? frame.top)) / 2 : frame.top + frame.height * 0.68;
+    const leftSide = faceContour.filter((p) => p.x < centerX);
+    if (leftSide.length) {
+      points.jawline = leftSide.reduce((best, p) =>
+        Math.abs(p.y - jawY) < Math.abs(best.y - jawY) ? p : best, leftSide[0]);
+    }
+  }
+
+  return points;
+};
+
+// Deterministic per-region "score" derived from real landmark geometry
+// (position + a face-specific spread), so the same photo always yields the
+// same reading instead of a different random number every time.
+const geometrySeededScore = (geo: FaceGeometry, region: FaceRegion, index: number): number => {
+  const { frame } = geo;
+  const points = deriveRegionPoints(geo);
+  const p = points[region.key];
+  const base = p && frame.width > 0
+    ? ((p.x * 13 + p.y * 7 + index * 41) % 97) / 97
+    : ((index + 1) * 0.618) % 1; // golden-ratio fallback if a point is missing
+  return 75 + Math.floor(base * 20); // 75–94, same range as before
+};
 
 // Elemental mapping by face shape
 const ELEMENTS = {
@@ -163,55 +228,96 @@ const FaceGuideOverlay: React.FC<{ size: number }> = ({ size }) => (
   </View>
 );
 
-// ─── Landmark dots on result photo ──────────────────────────────────────────
-const LandmarkDots: React.FC<{ accentColor: string }> = ({ accentColor }) => (
-  <View style={StyleSheet.absoluteFill}>
-    {FACE_REGIONS.map((region) => (
-      <View
-        key={region.key}
+// ─── A single landmark dot: staggered pop-in + soft breathing glow ─────────
+const LandmarkDot: React.FC<{
+  top: string; left: string; accentColor: string; delay: number;
+}> = ({ top, left, accentColor, delay }) => {
+  const enter = useRef(new Animated.Value(0)).current;
+  const glow = useRef(new Animated.Value(0.5)).current;
+
+  useEffect(() => {
+    Animated.sequence([
+      Animated.delay(delay),
+      Animated.spring(enter, { toValue: 1, friction: 5, tension: 80, useNativeDriver: true }),
+    ]).start(() => {
+      Animated.loop(
+        Animated.sequence([
+          Animated.timing(glow, { toValue: 1, duration: 1100, easing: Easing.inOut(Easing.ease), useNativeDriver: true }),
+          Animated.timing(glow, { toValue: 0.5, duration: 1100, easing: Easing.inOut(Easing.ease), useNativeDriver: true }),
+        ])
+      ).start();
+    });
+  }, []);
+
+  return (
+    <View style={{ position: 'absolute', top: top as any, left: left as any, marginLeft: -9, marginTop: -9 }}>
+      <Animated.View
         style={{
-          position: 'absolute',
-          top: region.dotPosition.top as any,
-          left: region.dotPosition.left as any,
-          marginLeft: -4,
-          marginTop: -4,
+          width: 18, height: 18, borderRadius: 9,
+          justifyContent: 'center', alignItems: 'center',
+          transform: [{ scale: enter }],
+          opacity: enter,
         }}
       >
-        <View style={{
-          width: 8,
-          height: 8,
-          borderRadius: 4,
-          backgroundColor: accentColor,
-          shadowColor: accentColor,
-          shadowOpacity: 0.8,
-          shadowRadius: 6,
-          elevation: 4,
+        <Animated.View style={{
+          position: 'absolute', width: 18, height: 18, borderRadius: 9,
+          backgroundColor: accentColor, opacity: glow.interpolate({ inputRange: [0.5, 1], outputRange: [0.15, 0.35] }),
+          transform: [{ scale: glow }],
         }} />
-      </View>
-    ))}
-    {/* Additional symmetry dots */}
-    <View style={{
-      position: 'absolute', top: '38%' as any, left: '65%' as any,
-      marginLeft: -4, marginTop: -4,
-    }}>
-      <View style={{
-        width: 8, height: 8, borderRadius: 4,
-        backgroundColor: accentColor,
-        shadowColor: accentColor, shadowOpacity: 0.8, shadowRadius: 6, elevation: 4,
-      }} />
+        <View style={{
+          width: 7, height: 7, borderRadius: 3.5,
+          backgroundColor: accentColor,
+          shadowColor: accentColor, shadowOpacity: 0.9, shadowRadius: 5, elevation: 4,
+        }} />
+      </Animated.View>
     </View>
-    <View style={{
-      position: 'absolute', top: '68%' as any, left: '72%' as any,
-      marginLeft: -4, marginTop: -4,
-    }}>
-      <View style={{
-        width: 8, height: 8, borderRadius: 4,
-        backgroundColor: accentColor,
-        shadowColor: accentColor, shadowOpacity: 0.8, shadowRadius: 6, elevation: 4,
-      }} />
+  );
+};
+
+// ─── Landmark dots on result photo — positioned from real face geometry ────
+const LandmarkDots: React.FC<{
+  accentColor: string;
+  geometry: FaceGeometry | null;
+  imageSize: { width: number; height: number } | null;
+}> = ({ accentColor, geometry, imageSize }) => {
+  const points = geometry ? deriveRegionPoints(geometry) : {};
+  const canUseReal = geometry && imageSize && imageSize.width > 0 && imageSize.height > 0;
+
+  return (
+    <View style={StyleSheet.absoluteFill}>
+      {FACE_REGIONS.map((region, i) => {
+        const p = canUseReal ? points[region.key] : undefined;
+        const top = p ? `${(p.y / imageSize!.height) * 100}%` : region.dotPosition.top;
+        const left = p ? `${(p.x / imageSize!.width) * 100}%` : region.dotPosition.left;
+        return (
+          <LandmarkDot key={region.key} top={top} left={left} accentColor={accentColor} delay={i * 90} />
+        );
+      })}
     </View>
-  </View>
-);
+  );
+};
+
+// ─── Staggered reveal wrapper for result cards ──────────────────────────────
+const StaggerReveal: React.FC<{ index: number; children: React.ReactNode }> = ({ index, children }) => {
+  const enter = useRef(new Animated.Value(0)).current;
+  useEffect(() => {
+    Animated.sequence([
+      Animated.delay(index * 110),
+      Animated.spring(enter, { toValue: 1, friction: 7, tension: 60, useNativeDriver: true }),
+    ]).start();
+  }, []);
+  return (
+    <Animated.View style={{
+      opacity: enter,
+      transform: [
+        { translateY: enter.interpolate({ inputRange: [0, 1], outputRange: [18, 0] }) },
+        { scale: enter.interpolate({ inputRange: [0, 1], outputRange: [0.96, 1] }) },
+      ],
+    }}>
+      {children}
+    </Animated.View>
+  );
+};
 
 // ─── Score bar component ────────────────────────────────────────────────────
 const ScoreBar: React.FC<{ score: number; color: string; bgColor: string }> = ({ score, color, bgColor }) => {
@@ -237,14 +343,31 @@ const ScoreBar: React.FC<{ score: number; color: string; bgColor: string }> = ({
   );
 };
 
-// ─── Determine face shape from image aspect ratio ───────────────────────────
-const determineFaceShape = (): ElementKey => {
-  // Since we crop to 1:1, use randomized heuristic weighted by common shapes
-  const rand = Math.random();
-  if (rand < 0.3) return 'Water';   // round
-  if (rand < 0.55) return 'Air';    // oval (most common)
-  if (rand < 0.75) return 'Earth';  // square
-  return 'Fire';                     // heart
+// ─── Determine face shape from real detected geometry ───────────────────────
+// Heuristic physiognomy classification — not a scientific measurement, but
+// grounded in this face's actual proportions (bounding-box aspect ratio +
+// jaw-to-cheekbone width from the ML Kit face contour) rather than chance.
+const determineFaceShape = (geo: FaceGeometry | null): ElementKey => {
+  if (!geo || geo.frame.width === 0 || geo.faceContour.length < 8) {
+    // No usable geometry (e.g. detector unavailable in Expo Go) — Air (oval)
+    // is the most common human face shape, a reasonable neutral default.
+    return 'Air';
+  }
+
+  const { frame, faceContour } = geo;
+  const heightToWidth = frame.height / frame.width;
+
+  const jawBand = faceContour.filter((p) => p.y > frame.top + frame.height * 0.75);
+  const cheekBand = faceContour.filter((p) => p.y > frame.top + frame.height * 0.35 && p.y < frame.top + frame.height * 0.6);
+  const spread = (pts: Point[]) => (pts.length < 2 ? 0 : Math.max(...pts.map(p => p.x)) - Math.min(...pts.map(p => p.x)));
+  const jawWidth = spread(jawBand);
+  const cheekWidth = spread(cheekBand) || frame.width;
+  const jawToCheek = jawWidth / cheekWidth;
+
+  if (heightToWidth >= 1.3) return 'Air';               // elongated — oval/oblong
+  if (jawToCheek >= 0.85) return 'Earth';                // strong, wide jaw ~ cheekbone width — square
+  if (jawToCheek < 0.65) return 'Fire';                  // narrow jaw vs wide cheeks — heart-shaped
+  return 'Water';                                        // soft, rounded proportions
 };
 
 // ─── AI system prompt ───────────────────────────────────────────────────────
@@ -273,6 +396,8 @@ export const FaceReadingScreen: React.FC = () => {
   const [selectedImage, setSelectedImage] = useState<string | null>(null);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [result, setResult] = useState<AnalysisResult | null>(null);
+  const [faceGeometry, setFaceGeometry] = useState<FaceGeometry | null>(null);
+  const [imageSize, setImageSize] = useState<{ width: number; height: number } | null>(null);
 
   const scanAnim = useRef(new Animated.Value(0)).current;
   const pulseAnim = useRef(new Animated.Value(1)).current;
@@ -338,7 +463,8 @@ export const FaceReadingScreen: React.FC = () => {
     });
     if (!res.canceled && res.assets[0]) {
       tracker.track('feature_tap', { feature: 'face_reading', source: 'camera' });
-      processImage(res.assets[0].uri);
+      const a = res.assets[0];
+      processImage(a.uri, a.width, a.height);
     }
   };
 
@@ -351,12 +477,13 @@ export const FaceReadingScreen: React.FC = () => {
     });
     if (!res.canceled && res.assets[0]) {
       tracker.track('feature_tap', { feature: 'face_reading', source: 'gallery' });
-      processImage(res.assets[0].uri);
+      const a = res.assets[0];
+      processImage(a.uri, a.width, a.height);
     }
   };
 
   // ── Process & analyze ─────────────────────────────────────────────────────
-  const processImage = async (uri: string) => {
+  const processImage = async (uri: string, pickedWidth?: number, pickedHeight?: number) => {
     // Token check
     const isPremium = user?.isPremium === true;
     if (!isPremium) {
@@ -396,20 +523,32 @@ export const FaceReadingScreen: React.FC = () => {
         removeTokens(TOKEN_COST);
       }
 
-      // Generate region scores
-      const regions: RegionResult[] = FACE_REGIONS.map((region) => {
+      const geo = faceCheck.faceGeometry ?? null;
+      setFaceGeometry(geo);
+      // The picker reports the exact pixel dimensions of the (already
+      // square-cropped) displayed image — landmark pixel coords from ML Kit
+      // are in that same image's coordinate space, so this is what we need
+      // to convert them into on-screen percentages.
+      setImageSize(pickedWidth && pickedHeight ? { width: pickedWidth, height: pickedHeight } : null);
+
+      // Region scores + interpretations — derived from this face's real
+      // geometry (see geometrySeededScore) so the same photo always reads
+      // the same way, instead of a fresh random number every attempt.
+      const regions: RegionResult[] = FACE_REGIONS.map((region, i) => {
         const interpretations = REGION_INTERPRETATIONS[region.key];
+        const score = geo ? geometrySeededScore(geo, region, i) : 75 + Math.floor(((i + 1) * 0.618 % 1) * 20);
+        const interpIndex = score % interpretations.length;
         return {
           key: region.key,
           label: region.label,
           icon: region.icon,
-          score: Math.floor(Math.random() * 20 + 75), // 75-94
-          interpretation: interpretations[Math.floor(Math.random() * interpretations.length)],
+          score,
+          interpretation: interpretations[interpIndex],
         };
       });
 
-      // Determine dominant element
-      const element = determineFaceShape();
+      // Determine dominant element from real face proportions
+      const element = determineFaceShape(geo);
 
       // Get AI summary
       let aiSummary = '';
@@ -439,6 +578,8 @@ export const FaceReadingScreen: React.FC = () => {
   const reset = () => {
     setSelectedImage(null);
     setResult(null);
+    setFaceGeometry(null);
+    setImageSize(null);
     fadeAnim.setValue(0);
   };
 
@@ -579,9 +720,9 @@ export const FaceReadingScreen: React.FC = () => {
                   </>
                 )}
 
-                {/* Landmark dots on result */}
+                {/* Landmark dots on result — positioned from real detected face geometry */}
                 {!isAnalyzing && result && (
-                  <LandmarkDots accentColor={Colors.accent.cyan} />
+                  <LandmarkDots accentColor={Colors.accent.cyan} geometry={faceGeometry} imageSize={imageSize} />
                 )}
               </Animated.View>
 
@@ -599,55 +740,61 @@ export const FaceReadingScreen: React.FC = () => {
                 <Animated.View style={[styles.resultContainer, { opacity: fadeAnim }]}>
 
                   {/* Dominant Element Card */}
-                  <View style={[styles.elementCard, { backgroundColor: cardBg, borderColor }]}>
-                    <View style={[styles.elementIconWrap, { backgroundColor: `${ELEMENTS[result.element].color}18` }]}>
-                      <Ionicons
-                        name={ELEMENTS[result.element].icon as any}
-                        size={28}
-                        color={ELEMENTS[result.element].color}
-                      />
+                  <StaggerReveal index={0}>
+                    <View style={[styles.elementCard, { backgroundColor: cardBg, borderColor }]}>
+                      <View style={[styles.elementIconWrap, { backgroundColor: `${ELEMENTS[result.element].color}18` }]}>
+                        <Ionicons
+                          name={ELEMENTS[result.element].icon as any}
+                          size={28}
+                          color={ELEMENTS[result.element].color}
+                        />
+                      </View>
+                      <View style={{ flex: 1 }}>
+                        <Text style={[styles.elementLabel, { color: secondaryText }]}>{t('dominantElement')}</Text>
+                        <Text style={[styles.elementName, { color: ELEMENTS[result.element].color }]}>
+                          {ELEMENTS[result.element].label}
+                        </Text>
+                        <Text style={[styles.elementShape, { color: secondaryText }]}>
+                          {ELEMENTS[result.element].shape} face shape detected
+                        </Text>
+                      </View>
                     </View>
-                    <View style={{ flex: 1 }}>
-                      <Text style={[styles.elementLabel, { color: secondaryText }]}>{t('dominantElement')}</Text>
-                      <Text style={[styles.elementName, { color: ELEMENTS[result.element].color }]}>
-                        {ELEMENTS[result.element].label}
-                      </Text>
-                      <Text style={[styles.elementShape, { color: secondaryText }]}>
-                        {ELEMENTS[result.element].shape} face shape detected
-                      </Text>
-                    </View>
-                  </View>
+                  </StaggerReveal>
 
                   {/* AI Summary Card */}
-                  <View style={[styles.summaryCard, {
-                    backgroundColor: isDark ? 'rgba(157,78,221,0.08)' : 'rgba(157,78,221,0.04)',
-                    borderColor: isDark ? 'rgba(157,78,221,0.2)' : 'rgba(157,78,221,0.12)',
-                  }]}>
-                    <View style={styles.summaryHeader}>
-                      <Ionicons name="finger-print" size={18} color={accent} />
-                      <Text style={[styles.summaryTitle, { color: accent }]}>{t('characterSummary')}</Text>
+                  <StaggerReveal index={1}>
+                    <View style={[styles.summaryCard, {
+                      backgroundColor: isDark ? 'rgba(157,78,221,0.08)' : 'rgba(157,78,221,0.04)',
+                      borderColor: isDark ? 'rgba(157,78,221,0.2)' : 'rgba(157,78,221,0.12)',
+                    }]}>
+                      <View style={styles.summaryHeader}>
+                        <Ionicons name="finger-print" size={18} color={accent} />
+                        <Text style={[styles.summaryTitle, { color: accent }]}>{t('characterSummary')}</Text>
+                      </View>
+                      <Text style={[styles.summaryText, { color: colors.text }]}>{result.aiSummary}</Text>
                     </View>
-                    <Text style={[styles.summaryText, { color: colors.text }]}>{result.aiSummary}</Text>
-                  </View>
+                  </StaggerReveal>
 
                   {/* 6 Region Analysis Cards */}
                   <Text style={[styles.sectionTitle, { color: colors.text }]}>{t('facialRegionAnalysis')}</Text>
-                  {result.regions.map((region) => (
-                    <View key={region.key} style={[styles.regionCard, { backgroundColor: cardBg, borderColor }]}>
-                      <View style={styles.regionHeader}>
-                        <View style={[styles.regionIconWrap, { backgroundColor: isDark ? 'rgba(157,78,221,0.12)' : 'rgba(157,78,221,0.06)' }]}>
-                          <Ionicons name={region.icon as any} size={18} color={accent} />
+                  {result.regions.map((region, i) => (
+                    <StaggerReveal key={region.key} index={2 + i}>
+                      <View style={[styles.regionCard, { backgroundColor: cardBg, borderColor }]}>
+                        <View style={styles.regionHeader}>
+                          <View style={[styles.regionIconWrap, { backgroundColor: isDark ? 'rgba(157,78,221,0.12)' : 'rgba(157,78,221,0.06)' }]}>
+                            <Ionicons name={region.icon as any} size={18} color={accent} />
+                          </View>
+                          <View style={{ flex: 1 }}>
+                            <Text style={[styles.regionLabel, { color: colors.text }]}>{region.label}</Text>
+                          </View>
+                          <Text style={[styles.regionScore, { color: accent }]}>{region.score}/100</Text>
                         </View>
-                        <View style={{ flex: 1 }}>
-                          <Text style={[styles.regionLabel, { color: colors.text }]}>{region.label}</Text>
-                        </View>
-                        <Text style={[styles.regionScore, { color: accent }]}>{region.score}/100</Text>
+                        <ScoreBar score={region.score} color={accent} bgColor={isDark ? 'rgba(255,255,255,0.06)' : 'rgba(0,0,0,0.06)'} />
+                        <Text style={[styles.regionInterpretation, { color: secondaryText }]}>
+                          {region.interpretation}
+                        </Text>
                       </View>
-                      <ScoreBar score={region.score} color={accent} bgColor={isDark ? 'rgba(255,255,255,0.06)' : 'rgba(0,0,0,0.06)'} />
-                      <Text style={[styles.regionInterpretation, { color: secondaryText }]}>
-                        {region.interpretation}
-                      </Text>
-                    </View>
+                    </StaggerReveal>
                   ))}
 
                   {/* New Analysis button */}

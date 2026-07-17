@@ -24,7 +24,7 @@ import { useNavigation } from '@react-navigation/native';
 import { useTheme } from '../hooks/useTheme';
 import { useTranslation } from '../hooks/useTranslation';
 import { useStore } from '../store/useStore';
-import { generateSoulmateImage } from '../services/geminiService';
+import { generateSoulmateImage, generateSoulmatePortraitImage, SoulmateParams } from '../services/geminiService';
 import { tracker } from '../services/eventTracker';
 import { Spacing, BorderRadius, FontSizes } from '../config/theme';
 
@@ -139,6 +139,9 @@ export const DrawSoulmateScreen: React.FC = () => {
   const [imageLoading, setImageLoading] = useState(true);
   const [zodiacSign, setZodiacSign] = useState('');
   const [errorMsg, setErrorMsg] = useState('');
+  const [imageRetrying, setImageRetrying] = useState(false);
+  const lastParamsRef = useRef<SoulmateParams | null>(null);
+  const imageRetryCountRef = useRef(0);
 
   // Animations
   const fadeAnim = useRef(new Animated.Value(0)).current;
@@ -263,13 +266,17 @@ export const DrawSoulmateScreen: React.FC = () => {
       const sign = user?.zodiacSign ?? deriveZodiac(birthDate);
       setZodiacSign(sign);
 
-      const result = await generateSoulmateImage({
+      const params: SoulmateParams = {
         birthDate,
         birthTime: birthTime || undefined,
         birthCity: birthCity || undefined,
         zodiacSign: sign || undefined,
         soulmateGender,
-      });
+      };
+      lastParamsRef.current = params;
+      imageRetryCountRef.current = 0;
+
+      const result = await generateSoulmateImage(params);
 
       // Finish progress bar
       Animated.timing(progressAnim, {
@@ -303,7 +310,29 @@ export const DrawSoulmateScreen: React.FC = () => {
     }
   };
 
+  // Retries ONLY the portrait image — the reading already succeeded and its
+  // tokens were already spent, so this must never charge tokens again.
+  const handleRetryImage = async () => {
+    if (!lastParamsRef.current || imageRetrying) return;
+    setImageRetrying(true);
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+    imageRetryCountRef.current += 1;
+    try {
+      const uri = await generateSoulmatePortraitImage(lastParamsRef.current, imageRetryCountRef.current);
+      if (uri) {
+        setImageUri(uri);
+        setImageLoading(true);
+      } else {
+        Alert.alert('Still unavailable', 'The sketch service is still busy. Please try again in a moment.');
+      }
+    } finally {
+      setImageRetrying(false);
+    }
+  };
+
   const reset = () => {
+    lastParamsRef.current = null;
+    imageRetryCountRef.current = 0;
     setStep('input');
     setPortrait(null);
     setImageUri(null);
@@ -591,13 +620,14 @@ export const DrawSoulmateScreen: React.FC = () => {
               </Text>
 
               {/* Generated sketch */}
-              {imageUri && (
+              {imageUri ? (
                 <View style={[s.portraitImageWrap, { borderColor: isDark ? colors.border : colors.divider, backgroundColor: isDark ? colors.card : colors.surface }]}>
                   <Image
                     source={{ uri: imageUri }}
                     style={s.portraitImage}
                     resizeMode="cover"
                     onLoadEnd={() => setImageLoading(false)}
+                    onError={() => setImageLoading(false)}
                   />
                   {imageLoading && (
                     <View style={s.portraitLoading}>
@@ -605,6 +635,25 @@ export const DrawSoulmateScreen: React.FC = () => {
                       <Text style={[s.pillText, { color: colors.textSecondary, marginTop: 8 }]}>{t('sketching')}</Text>
                     </View>
                   )}
+                </View>
+              ) : (
+                // The free sketch service was unresponsive after several
+                // retries — the reading itself still succeeded (below), only
+                // the portrait image is missing this time.
+                <View style={[s.portraitImageWrap, { borderColor: isDark ? colors.border : colors.divider, backgroundColor: isDark ? colors.card : colors.surface, justifyContent: 'center', alignItems: 'center' }]}>
+                  {imageRetrying ? (
+                    <ActivityIndicator color={ACCENT} />
+                  ) : (
+                    <Ionicons name="image-outline" size={40} color={colors.textTertiary} />
+                  )}
+                  <Text style={[s.pillText, { color: colors.textSecondary, marginTop: 10, textAlign: 'center', paddingHorizontal: 16 }]}>
+                    The portrait sketch couldn't be drawn this time
+                  </Text>
+                  <TouchableOpacity onPress={handleRetryImage} disabled={imageRetrying} style={{ marginTop: 10 }}>
+                    <Text style={[s.pillText, { color: ACCENT, fontWeight: '700' }]}>
+                      {imageRetrying ? 'Retrying...' : 'Try drawing again'}
+                    </Text>
+                  </TouchableOpacity>
                 </View>
               )}
 

@@ -12,6 +12,7 @@ import { OfflineBanner } from './src/components/OfflineBanner';
 import { AppNavigator } from './src/navigation/AppNavigator';
 import { useStore } from './src/store/useStore';
 import { initializeRevenueCat } from './src/services/revenueCat';
+import { initializeAdMob } from './src/services/adMob';
 import { ErrorBoundary } from './src/components/ErrorBoundary';
 import { ToastProvider } from './src/components/Toast';
 import { startHealthMonitoring } from './src/services/healthCheck';
@@ -35,6 +36,9 @@ export default function App() {
       try {
         // Initialize RevenueCat
         await initializeRevenueCat();
+
+        // Initialize AdMob (non-blocking — ads are optional)
+        initializeAdMob().catch(() => {});
 
         // Load persisted state
         await loadPersistedState();

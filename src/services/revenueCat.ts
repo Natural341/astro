@@ -10,38 +10,45 @@ import RevenueCatUI, { PAYWALL_RESULT } from 'react-native-purchases-ui';
 import { AppConfig } from '../config/appConfig';
 import { handleSecureError } from '../utils/security';
 
-// Get platform-specific API key
-const getApiKey = (): string => {
+// Get platform-specific API key. Returns null if not configured for this platform.
+const getApiKey = (): string | null => {
   const androidKey = AppConfig.revenueCatGoogleApiKey;
   const iosKey = AppConfig.revenueCatAppleApiKey;
+  const key = Platform.OS === 'ios' ? iosKey : androidKey;
 
-  if (!androidKey || !iosKey) {
-    if (__DEV__) console.warn('RevenueCat API keys not configured. Using test keys.');
-    return 'test_aBAyqdxlbeRruIgflrxWoYzrfTh';
+  if (!key || key.startsWith('your_') || key.startsWith('YOUR_')) {
+    if (__DEV__) {
+      console.warn('[RevenueCat] API key not configured for this platform — using test key (dev only).');
+      return 'test_aBAyqdxlbeRruIgflrxWoYzrfTh';
+    }
+    return null;
   }
-
-  if (Platform.OS === 'ios') {
-    return iosKey;
-  }
-  return androidKey;
+  return key;
 };
 
+let revenueCatReady = false;
+
 /**
- * Initialize RevenueCat SDK
+ * Initialize RevenueCat SDK. In production, if the platform API key isn't
+ * configured, purchases stay disabled instead of silently running against
+ * RevenueCat's shared public test key (which cannot process real payments).
  */
 export const initializeRevenueCat = async (): Promise<void> => {
   try {
-    // Set log level based on environment
     const logLevel = __DEV__ ? LOG_LEVEL.VERBOSE : LOG_LEVEL.ERROR;
     Purchases.setLogLevel(logLevel);
 
     const apiKey = getApiKey();
+    if (!apiKey) {
+      if (__DEV__) console.warn('[RevenueCat] Not initialized — missing production API key.');
+      return;
+    }
 
-    // Configure Purchases
     await Purchases.configure({
       apiKey,
       appUserID: undefined, // Let RevenueCat handle user IDs
     });
+    revenueCatReady = true;
 
     if (__DEV__) {
       console.log('[RevenueCat] Initialized successfully');
@@ -50,6 +57,9 @@ export const initializeRevenueCat = async (): Promise<void> => {
     handleSecureError(error, 'RevenueCat');
   }
 };
+
+/** Whether RevenueCat was successfully configured with a real API key. */
+export const isRevenueCatReady = (): boolean => revenueCatReady;
 
 /**
  * Check if user has premium entitlement
@@ -122,6 +132,29 @@ export const purchasePackage = async (packageToPurchase: PurchasesPackage): Prom
   } catch (error) {
     handleSecureError(error, 'RevenueCat');
     return false;
+  }
+};
+
+/**
+ * Purchase a consumable package (e.g. a token pack) — unlike purchasePackage(),
+ * this does not check for the premium entitlement (consumables don't grant one).
+ * Returns the resulting CustomerInfo on success, or null on cancel/error.
+ */
+export const purchaseConsumablePackage = async (
+  packageToPurchase: PurchasesPackage,
+): Promise<CustomerInfo | null> => {
+  try {
+    const { customerInfo } = await Purchases.purchasePackage(packageToPurchase);
+    if (__DEV__) {
+      console.log('[RevenueCat] Consumable purchase successful');
+    }
+    return customerInfo;
+  } catch (error: any) {
+    if (error?.userCancelled) {
+      return null;
+    }
+    handleSecureError(error, 'RevenueCat');
+    return null;
   }
 };
 

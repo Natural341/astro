@@ -232,7 +232,11 @@ const isNetworkError = (e: unknown): boolean => {
  * SIGN IN — Backend-first.
  * 1. Try Go backend (PostgreSQL) — this is the source of truth
  * 2. If backend succeeds → cache user locally for future offline access
- * 3. If backend unreachable → try local cache as fallback
+ * 3. If backend unreachable AND running in __DEV__ → try local cache as a dev-only fallback
+ *    (offline dev testing). In production this would silently hand out a fake
+ *    `local_<id>` token that the backend can never validate, so every
+ *    subsequent authenticated request would fail with no clear explanation —
+ *    real users must instead see a clear "can't reach server" error.
  */
 export const signIn = async (
   email: string,
@@ -252,10 +256,13 @@ export const signIn = async (
     return data;
   } catch (e) {
     if (!isNetworkError(e)) throw e; // real error (wrong password etc.) — propagate
-    if (__DEV__) console.log('[auth] Backend unreachable, trying local cache');
+    if (!__DEV__) {
+      throw new Error('Could not connect to server. Please check your internet connection and try again.');
+    }
+    console.log('[auth] Backend unreachable, trying local cache (dev only)');
   }
 
-  // ── 2. Backend unreachable — try local cache ──
+  // ── 2. Backend unreachable — dev-only local cache fallback ──
   const users = await getLocalUsers();
   const cached = users.find(u => u.email.toLowerCase() === email.toLowerCase());
   if (!cached) {
@@ -477,14 +484,32 @@ export const validatePromoCode = async (code: string): Promise<PromoCodeResult> 
 };
 
 // ─── Tokens ────────────────────────────────────────────────────────────────────
+/**
+ * Validates a token package still exists and returns the current balance.
+ * This does NOT credit tokens — only the RevenueCat webhook does that, once
+ * the purchase is confirmed server-side. Use this as a pre-flight check
+ * before initiating a RevenueCat purchase.
+ */
 export const purchaseTokens = async (
   packageId: string,
-  receiptData: string,
 ): Promise<{ tokens: number; new_total: number }> => {
-  return apiFetch('/api/v1/tokens/purchase', {
-    method: 'POST',
-    body: JSON.stringify({ package_id: packageId, receipt_data: receiptData }),
-  });
+  const res = await apiFetch<{ success: boolean; tokens_added: number; token_balance: number }>(
+    '/api/v1/tokens/purchase',
+    {
+      method: 'POST',
+      body: JSON.stringify({ package_id: packageId }),
+    },
+  );
+  return { tokens: res.tokens_added, new_total: res.token_balance };
+};
+
+/** Claim tokens for having watched a rewarded ad. Daily limit is enforced server-side. */
+export const claimAdReward = async (): Promise<{ tokens: number; new_total: number }> => {
+  const res = await apiFetch<{ success: boolean; tokens_added: number; token_balance: number }>(
+    '/api/v1/tokens/ad-reward',
+    { method: 'POST', body: JSON.stringify({}) },
+  );
+  return { tokens: res.tokens_added, new_total: res.token_balance };
 };
 
 /** Deduct tokens server-side (source of truth). Returns the authoritative new balance. */

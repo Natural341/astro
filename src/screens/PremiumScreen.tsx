@@ -27,8 +27,11 @@ import { useTheme } from '../hooks/useTheme';
 import { useTranslation } from '../hooks/useTranslation';
 import { Spacing } from '../config/theme';
 import { AppConfig } from '../config/appConfig';
-import { getTokenPackages, ApiTokenPackage, validatePromoCode, PromoCodeResult } from '../services/api';
+import { getTokenPackages, ApiTokenPackage, validatePromoCode, PromoCodeResult, purchaseTokens as apiPurchaseTokens, claimAdReward, getMe } from '../services/api';
 import { tracker } from '../services/eventTracker';
+import { getOfferings, purchasePackage, purchaseConsumablePackage } from '../services/revenueCat';
+import { showRewardedAd, getBannerAdUnitId } from '../services/adMob';
+import type { PurchasesOffering } from 'react-native-purchases';
 
 const { width } = Dimensions.get('window');
 
@@ -173,6 +176,16 @@ export const PremiumScreen: React.FC = () => {
   const [promoError, setPromoError] = useState('');
   const [promoLoading, setPromoLoading] = useState(false);
 
+  const [offering, setOffering] = useState<PurchasesOffering | null>(null);
+  const [subscribeLoading, setSubscribeLoading] = useState(false);
+  const [tokenPurchaseLoading, setTokenPurchaseLoading] = useState(false);
+  const [adRewardLoading, setAdRewardLoading] = useState(false);
+
+  // Fetch live RevenueCat offering (subscription plans + token product packages)
+  useEffect(() => {
+    getOfferings().then(setOffering).catch(() => setOffering(null));
+  }, []);
+
   // Track premium screen view
   useEffect(() => {
     tracker.track('premium_view', { screen: 'Premium' });
@@ -236,16 +249,61 @@ export const PremiumScreen: React.FC = () => {
 
   const handleSubscribe = async () => {
     await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
-    Alert.alert(
-      'Welcome to Premium',
-      'Your subscription is now active. All features are unlocked.',
-      [{ text: 'Continue', onPress: () => { updateUser({ isPremium: true }); navigation.goBack(); } }],
-    );
+
+    const rcPackage = selectedPlan === 'yearly' ? offering?.annual : offering?.monthly;
+    if (!rcPackage) {
+      Alert.alert(
+        'Unavailable',
+        'Subscription plans are not available right now. Please try again later.',
+      );
+      return;
+    }
+
+    setSubscribeLoading(true);
+    try {
+      const isPremium = await purchasePackage(rcPackage);
+      if (isPremium) {
+        await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+        updateUser({ isPremium: true });
+        Alert.alert(
+          'Welcome to Premium',
+          'Your subscription is now active. All features are unlocked.',
+          [{ text: 'Continue', onPress: () => navigation.goBack() }],
+        );
+      }
+      // purchasePackage() already surfaces cancellation/errors via handleSecureError;
+      // no separate alert needed when isPremium is false (user cancelled or it failed silently).
+    } finally {
+      setSubscribeLoading(false);
+    }
   };
 
   const handleTokenPurchase = async (pack: typeof tokenPacks[0]) => {
     await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
     setSelectedToken(pack.id);
+  };
+
+  const handleWatchAd = async () => {
+    if (adRewardLoading) return;
+    await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+    setAdRewardLoading(true);
+    try {
+      const watched = await showRewardedAd();
+      if (!watched) return; // cancelled, failed to load, or closed before earning the reward
+
+      const result = await claimAdReward();
+      if (user) updateUser({ tokens: result.new_total });
+      await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+      Alert.alert('Reward earned', `+${result.tokens} Moon Tokens added to your account.`);
+    } catch (e: any) {
+      await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
+      Alert.alert(
+        e?.message?.includes('limit') ? 'Daily limit reached' : 'Something went wrong',
+        e?.message?.includes('limit') ? "You've watched the max ads for today. Come back tomorrow!" : 'Please try again later.',
+      );
+    } finally {
+      setAdRewardLoading(false);
+    }
   };
 
   const handleApplyPromo = async () => {
@@ -282,6 +340,24 @@ export const PremiumScreen: React.FC = () => {
       promoLine = `\n${promoResult.code} applied`;
     }
 
+    // RevenueCat package identifiers must match the backend token_packages.id
+    // (configure this convention when setting up products in the RC dashboard).
+    const rcPackage = offering?.availablePackages.find(
+      p => p.identifier === pack.id || p.product.identifier === pack.id,
+    );
+    if (!rcPackage) {
+      Alert.alert('Unavailable', 'This token package is not available for purchase right now.');
+      return;
+    }
+
+    // Pre-flight check — don't charge the user for a package the backend no longer has.
+    try {
+      await apiPurchaseTokens(pack.id);
+    } catch (e: any) {
+      Alert.alert('Unavailable', e?.message || 'This token package is no longer available.');
+      return;
+    }
+
     Alert.alert(
       'Purchase Tokens',
       `Buy ${finalTokens.toLocaleString()} Moon Tokens for ${finalPrice.toFixed(2)}₺?${promoLine}`,
@@ -289,9 +365,46 @@ export const PremiumScreen: React.FC = () => {
         { text: 'Cancel', style: 'cancel' },
         {
           text: 'Buy Now',
-          onPress: () => {
-            if (user) updateUser({ tokens: (user.tokens || 0) + finalTokens });
-            Alert.alert('Done', `${finalTokens.toLocaleString()} Moon Tokens added to your account.`);
+          onPress: async () => {
+            setTokenPurchaseLoading(true);
+            try {
+              const info = await purchaseConsumablePackage(rcPackage);
+              if (!info) return; // cancelled or failed — purchaseConsumablePackage already surfaced the error
+
+              // The purchase is complete on RevenueCat's side, but tokens are
+              // only credited once their webhook reaches our backend (usually
+              // within a couple seconds) — see RevenueCatWebhook on the server.
+              // Poll briefly for the balance to update rather than trusting
+              // the client to know how many tokens were bought.
+              const startingBalance = user?.tokens ?? 0;
+              const expectedBalance = startingBalance + finalTokens;
+              let newBalance = startingBalance;
+              for (let attempt = 0; attempt < 8; attempt++) {
+                await new Promise(r => setTimeout(r, 1500));
+                const me = await getMe().catch(() => null);
+                if (me && me.tokens >= expectedBalance) {
+                  newBalance = me.tokens;
+                  break;
+                }
+                if (me) newBalance = me.tokens;
+              }
+
+              if (user) updateUser({ tokens: newBalance });
+              await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+              if (newBalance >= expectedBalance) {
+                Alert.alert('Done', `${finalTokens.toLocaleString()} Moon Tokens added to your account.`);
+              } else {
+                Alert.alert(
+                  'Purchase confirmed',
+                  'Your payment went through — tokens may take a minute to appear. Pull to refresh if they don\'t show up shortly.',
+                );
+              }
+            } catch (e: any) {
+              await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
+              Alert.alert('Purchase failed', e?.message || 'Something went wrong. Please try again.');
+            } finally {
+              setTokenPurchaseLoading(false);
+            }
           },
         },
       ]
@@ -579,6 +692,25 @@ export const PremiumScreen: React.FC = () => {
               </Text>
             </TouchableOpacity>
           </View>
+
+          {/* Watch ad for free tokens */}
+          {!user?.isPremium && getBannerAdUnitId() && (
+            <View style={[styles.ctaWrap, { paddingHorizontal: Spacing.lg, marginTop: 10 }]}>
+              <TouchableOpacity
+                style={[styles.tokenCTA, { backgroundColor: 'transparent', borderWidth: 1, borderColor: cardBorder }]}
+                onPress={handleWatchAd}
+                activeOpacity={0.85}
+                disabled={adRewardLoading}
+              >
+                <View style={styles.tokenCTALeft}>
+                  <CoinIcon size={22} />
+                  <Text style={[styles.tokenCTAText, { color: textColor }]}>
+                    {adRewardLoading ? 'Loading ad...' : t('watchAdForTokens')}
+                  </Text>
+                </View>
+              </TouchableOpacity>
+            </View>
+          )}
 
           {/* Legal */}
           <View style={styles.legalRow}>

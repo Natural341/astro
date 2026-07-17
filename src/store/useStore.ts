@@ -5,6 +5,7 @@ import { User, StreakData } from '../types';
 import { ThemeMode } from '../config/theme';
 import { signOut as apiSignOut, clearJwt, deductTokens } from '../services/api';
 import { ASTROLOGERS } from '../data/astrologers';
+import { setUserID as rcSetUserID, logOut as rcLogOut } from '../services/revenueCat';
 
 const isGuestUser = (u: User | null): boolean => !u?.id || u.id.startsWith('guest_') || u.id.startsWith('local_');
 
@@ -69,6 +70,12 @@ export const useStore = create<AppState>((set, get) => ({
   setUser: (user) => {
     set({ user, isAuthenticated: !!user });
     get().persistState();
+    // Align RevenueCat's identity with our backend user id so the
+    // RevenueCat webhook can map purchase events back to this user.
+    // Guest/local-fallback ids never exist in the backend, so skip those.
+    if (user && !isGuestUser(user)) {
+      rcSetUserID(user.id).catch(() => {});
+    }
   },
 
   updateUser: (updates) => {
@@ -110,6 +117,7 @@ export const useStore = create<AppState>((set, get) => ({
       streak: initialStreak,
     });
     await AsyncStorage.multiRemove(['user', 'streak']);
+    rcLogOut().catch(() => {});
   },
 
   // Friends

@@ -14,6 +14,7 @@ import {
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useNavigation, useFocusEffect } from '@react-navigation/native';
 import { LinearGradient } from 'expo-linear-gradient';
+import { AppBannerAd } from '../components/AppBannerAd';
 
 import {
   CoinIcon,
@@ -373,6 +374,8 @@ export const HomeScreen: React.FC = () => {
             />
           ))}
         </View>
+
+        {!user?.isPremium && <AppBannerAd />}
 
         <View style={styles.bottomSpacer} />
       </Animated.ScrollView>

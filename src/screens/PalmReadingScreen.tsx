@@ -27,6 +27,7 @@ import { useStore } from '../store/useStore';
 import { Spacing, BorderRadius, FontSizes, Colors } from '../config/theme';
 import { interpretPalmReading } from '../services/geminiService';
 import { detectSubject } from '../services/imageDetection';
+import { detectHand, preloadHandDetector, HandDetectionResult } from '../services/handDetection';
 import { tokenService } from '../services/tokenService';
 import { tracker } from '../services/eventTracker';
 
@@ -149,6 +150,118 @@ const parseAIResult = (raw: string): PalmResult => {
   };
 };
 
+// ---------- Real palm line paths, derived from detected hand joints ----------
+// MediaPipe Hands only gives us 21 skeletal joints (knuckles/wrist), not the
+// actual crease lines (that remains an unsolved, research-grade CV problem —
+// no open-source model does it reliably). What we CAN do honestly: draw the
+// classic palmistry lines correctly scaled, rotated, and positioned onto
+// *this specific* photographed hand using its real joint positions, instead
+// of a generic fixed diagram that ignores hand size/angle/position entirely.
+type HandJoints = HandDetectionResult['joints'];
+
+const lerp = (a: { x: number; y: number }, b: { x: number; y: number }, t: number) => ({
+  x: a.x + (b.x - a.x) * t,
+  y: a.y + (b.y - a.y) * t,
+});
+
+// Smooth a polyline into a single SVG path via quadratic curves through midpoints.
+const smoothPath = (pts: { x: number; y: number }[]): string => {
+  if (pts.length < 2) return '';
+  if (pts.length === 2) return `M${pts[0].x},${pts[0].y} L${pts[1].x},${pts[1].y}`;
+  let d = `M${pts[0].x},${pts[0].y}`;
+  for (let i = 0; i < pts.length - 1; i++) {
+    const curr = pts[i];
+    const next = pts[i + 1];
+    d += ` Q${curr.x},${curr.y} ${(curr.x + next.x) / 2},${(curr.y + next.y) / 2}`;
+  }
+  const last = pts[pts.length - 1];
+  d += ` L${last.x},${last.y}`;
+  return d;
+};
+
+interface HandLinePaths { life: string; heart: string; head: string; fate: string }
+
+const deriveHandLinePaths = (j: Partial<HandJoints>): HandLinePaths | null => {
+  const { wrist, thumb_cmc, thumb_mcp, index_finger_mcp, middle_finger_mcp, ring_finger_mcp, pinky_finger_mcp } = j;
+  if (!wrist || !thumb_cmc || !index_finger_mcp || !middle_finger_mcp || !ring_finger_mcp || !pinky_finger_mcp) {
+    return null;
+  }
+  const thumbBase = thumb_mcp ?? thumb_cmc;
+
+  const heart = smoothPath(
+    [pinky_finger_mcp, ring_finger_mcp, middle_finger_mcp, index_finger_mcp].map(p => lerp(p, wrist, 0.12))
+  );
+  const head = smoothPath([
+    lerp(index_finger_mcp, wrist, 0.32),
+    lerp(middle_finger_mcp, wrist, 0.4),
+    lerp(ring_finger_mcp, wrist, 0.36),
+  ]);
+  const life = smoothPath([
+    lerp(index_finger_mcp, thumbBase, 0.5),
+    lerp(thumb_cmc, wrist, 0.3),
+    lerp(wrist, thumb_cmc, 0.2),
+  ]);
+  const fate = smoothPath([
+    lerp(wrist, middle_finger_mcp, 0.1),
+    lerp(wrist, middle_finger_mcp, 0.5),
+    lerp(middle_finger_mcp, wrist, 0.1),
+  ]);
+
+  return { life, heart, head, fate };
+};
+
+// ---------- Animated "drawing itself" line ──────────────────────────────────
+const AnimatedPath = Animated.createAnimatedComponent(Path);
+const DRAW_LENGTH = 500; // safely larger than any expected path length in image-pixel space
+
+const DrawnLine: React.FC<{ d: string; color: string; delay: number; width?: number }> = ({ d, color, delay, width = 3 }) => {
+  const progress = useRef(new Animated.Value(0)).current;
+  useEffect(() => {
+    progress.setValue(0);
+    Animated.sequence([
+      Animated.delay(delay),
+      Animated.timing(progress, { toValue: 1, duration: 900, easing: Easing.out(Easing.cubic), useNativeDriver: true }),
+    ]).start();
+  }, [d]);
+
+  const dashOffset = progress.interpolate({ inputRange: [0, 1], outputRange: [DRAW_LENGTH, 0] });
+
+  return (
+    <AnimatedPath
+      d={d}
+      stroke={color}
+      strokeWidth={width}
+      strokeLinecap="round"
+      fill="none"
+      opacity={0.92}
+      strokeDasharray={`${DRAW_LENGTH}, ${DRAW_LENGTH}`}
+      strokeDashoffset={dashOffset as any}
+    />
+  );
+};
+
+// Real-photo line overlay — positioned in the image's own pixel coordinate
+// space via the SVG viewBox, so it lines up regardless of display size.
+const HandLineOverlay: React.FC<{
+  joints: HandJoints | null;
+  imageSize: { width: number; height: number } | null;
+}> = ({ joints, imageSize }) => {
+  if (!joints || !imageSize || imageSize.width === 0) return null;
+  const paths = deriveHandLinePaths(joints);
+  if (!paths) return null;
+
+  return (
+    <View style={StyleSheet.absoluteFill} pointerEvents="none">
+      <Svg width="100%" height="100%" viewBox={`0 0 ${imageSize.width} ${imageSize.height}`}>
+        <DrawnLine d={paths.life} color="#EF4444" delay={0} />
+        <DrawnLine d={paths.heart} color="#EC4899" delay={150} />
+        <DrawnLine d={paths.head} color="#3B82F6" delay={300} />
+        <DrawnLine d={paths.fate} color="#F59E0B" delay={450} width={2.5} />
+      </Svg>
+    </View>
+  );
+};
+
 // ---------- SVG line position mini diagrams ----------
 const LinePositionSvg: React.FC<{ lineName: string; color: string }> = ({ lineName, color }) => {
   const dim = 60;
@@ -184,6 +297,9 @@ export const PalmReadingScreen: React.FC = () => {
   const [showGuide, setShowGuide] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [selectedMode, setSelectedMode] = useState<string>('full');
+  const [handJoints, setHandJoints] = useState<HandJoints | null>(null);
+  const [handedness, setHandedness] = useState<'Left' | 'Right' | null>(null);
+  const [imageSize, setImageSize] = useState<{ width: number; height: number } | null>(null);
 
   // Animations
   const pulseAnim = useRef(new Animated.Value(0)).current;
@@ -192,7 +308,10 @@ export const PalmReadingScreen: React.FC = () => {
   const fadeIn = useRef(new Animated.Value(0)).current;
   const handFloat = useRef(new Animated.Value(0)).current;
 
-  useEffect(() => { tracker.track('screen_view', { screen: 'PalmReading' }); }, []);
+  useEffect(() => {
+    tracker.track('screen_view', { screen: 'PalmReading' });
+    preloadHandDetector(); // warm up the TFJS hand model in the background
+  }, []);
 
   // Pulse
   useEffect(() => {
@@ -236,7 +355,8 @@ export const PalmReadingScreen: React.FC = () => {
       result = await ImagePicker.launchImageLibraryAsync(options);
     }
     if (!result.canceled && result.assets[0]) {
-      const uri = result.assets[0].uri;
+      const asset = result.assets[0];
+      const uri = asset.uri;
       const handCheck = await detectSubject(uri, 'palm');
       if (!handCheck.accepted) {
         Alert.alert('No Hand Detected', 'Please capture a clear photo of your open palm.');
@@ -244,12 +364,18 @@ export const PalmReadingScreen: React.FC = () => {
       }
       setSelectedImage(uri);
       setShowGuide(false);
-      analyzeImage(uri);
+      setImageSize(asset.width && asset.height ? { width: asset.width, height: asset.height } : null);
+      setHandJoints(null);
+      setHandedness(null);
+      // Kick off real hand-joint detection in parallel with the AI text
+      // analysis — both are ready by the time the result view renders.
+      const handPromise = detectHand(uri);
+      analyzeImage(uri, handPromise);
     }
   }, [selectedMode]);
 
   // ---------- Analyze ----------
-  const analyzeImage = async (_imageUri: string) => {
+  const analyzeImage = async (_imageUri: string, handPromise?: Promise<HandDetectionResult | null>) => {
     setError(null);
     setIsAnalyzing(true);
     setPalmResult(null);
@@ -325,8 +451,16 @@ Respond in English. Be specific, insightful, and encouraging.`;
       }
       Animated.timing(progressAnim, { toValue: 1, duration: 400, useNativeDriver: false }).start();
       const parsed = parseAIResult(rawResult);
+
+      // Real hand geometry — enhancement only, never blocks the reading.
+      const hand = handPromise ? await handPromise.catch(() => null) : null;
+      if (hand) {
+        setHandJoints(hand.joints);
+        setHandedness(hand.handedness);
+      }
+
       setPalmResult(parsed);
-      tracker.track('feature_complete', { feature: 'palm_reading', mode: selectedMode });
+      tracker.track('feature_complete', { feature: 'palm_reading', mode: selectedMode, hand_detected: !!hand });
     } catch (e: any) {
       setError(e.message || 'Failed to analyze palm. Please try again.');
     } finally {
@@ -342,6 +476,9 @@ Respond in English. Be specific, insightful, and encouraging.`;
     setIsAnalyzing(false);
     setError(null);
     setShowGuide(true);
+    setHandJoints(null);
+    setHandedness(null);
+    setImageSize(null);
   };
 
   // Colors — black/white theme
@@ -505,7 +642,18 @@ Respond in English. Be specific, insightful, and encouraging.`;
           </View>
 
           {selectedImage && (
-            <Image source={{ uri: selectedImage }} style={[st.resultImg, { borderColor: tintBorder }]} />
+            <View style={[st.resultImg, { borderColor: tintBorder, overflow: 'hidden' }]}>
+              <Image source={{ uri: selectedImage }} style={{ width: '100%', height: '100%' }} />
+              <HandLineOverlay joints={handJoints} imageSize={imageSize} />
+              {handedness && (
+                <View style={[st.handednessBadge, { backgroundColor: 'rgba(0,0,0,0.55)' }]}>
+                  <Ionicons name="hand-left-outline" size={12} color="#FFF" />
+                  <Text style={st.handednessText}>
+                    {handedness === 'Right' ? 'Right hand — present' : 'Left hand — potential'}
+                  </Text>
+                </View>
+              )}
+            </View>
           )}
 
           {/* Summary */}
@@ -724,7 +872,13 @@ const st = StyleSheet.create({
   // Result
   successBanner: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', padding: 14, borderRadius: 14, borderWidth: 1, marginBottom: Spacing.lg, gap: 10 },
   successText: { fontSize: FontSizes.lg, fontWeight: '700' },
-  resultImg: { width: '100%', height: 200, borderRadius: 20, marginBottom: Spacing.lg, borderWidth: 1 },
+  resultImg: { width: '100%', height: 200, borderRadius: 20, marginBottom: Spacing.lg, borderWidth: 1, position: 'relative' },
+  handednessBadge: {
+    position: 'absolute', bottom: 10, left: 10,
+    flexDirection: 'row', alignItems: 'center', gap: 5,
+    paddingHorizontal: 10, paddingVertical: 5, borderRadius: 12,
+  },
+  handednessText: { fontSize: 11, fontWeight: '600', color: '#FFF' },
 
   // Section card
   sectionCard: { padding: 16, borderRadius: 16, borderWidth: 1, marginBottom: Spacing.md },

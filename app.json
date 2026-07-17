@@ -15,7 +15,10 @@
     },
     "ios": {
       "supportsTablet": true,
-      "bundleIdentifier": "com.kosmosastro.app"
+      "bundleIdentifier": "com.kosmosastro.app",
+      "infoPlist": {
+        "NSUserTrackingUsageDescription": "This identifier will be used to deliver personalized ads to you."
+      }
     },
     "android": {
       "adaptiveIcon": {
@@ -40,6 +43,14 @@
         "expo-av",
         {
           "microphonePermission": "Allow Kosmos Astro to use the microphone for voice messages."
+        }
+      ],
+      [
+        "react-native-google-mobile-ads",
+        {
+          "androidAppId": "ca-app-pub-9820692509784082~5030917430",
+          "iosAppId": "ca-app-pub-9820692509784082~2880744934",
+          "userTrackingUsageDescription": "This identifier will be used to deliver personalized ads to you."
         }
       ]
     ],

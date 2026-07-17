@@ -255,14 +255,96 @@ export const calculateSynastry = async (p1: any, p2: any): Promise<string> => {
   return chatWithAI(context);
 };
 
-// Soulmate portrait — image generation with text fallback
-export const generateSoulmateImage = async (params: {
+// Fetches a remote image and inlines it as a data URI, retrying on failure.
+// We do NOT hand the raw remote URL to <Image> — Pollinations' free legacy
+// endpoint occasionally returns a 500 "queue full" JSON error instead of an
+// image, and RN's <Image> has no built-in retry, so a transient failure would
+// otherwise render as a permanently broken image with no recovery. By fully
+// downloading (and validating) the image ourselves first, the app only ever
+// receives a URI once it's confirmed to be real, already-loaded image bytes.
+const fetchImageAsDataUri = async (url: string): Promise<{ base64: string; mimeType: string } | null> => {
+  try {
+    const response = await fetch(url);
+    if (!response.ok) return null;
+    const contentType = response.headers.get('content-type') || '';
+    if (!contentType.startsWith('image/')) return null; // error responses come back as JSON
+    const blob = await response.blob();
+    return await new Promise((resolve) => {
+      const reader = new FileReader();
+      reader.onload = () => {
+        const dataUrl = reader.result as string;
+        const [header, base64] = dataUrl.split(',');
+        const mimeType = header.match(/:(.*?);/)?.[1] || contentType;
+        resolve(base64 ? { base64, mimeType } : null);
+      };
+      reader.onerror = () => resolve(null);
+      reader.readAsDataURL(blob);
+    });
+  } catch {
+    return null;
+  }
+};
+
+const fetchImageWithRetry = async (url: string, attempts = 3): Promise<string | null> => {
+  for (let i = 0; i < attempts; i++) {
+    const result = await fetchImageAsDataUri(url);
+    if (result) return `data:${result.mimeType};base64,${result.base64}`;
+    if (i < attempts - 1) await new Promise((r) => setTimeout(r, 1000 * (i + 1)));
+  }
+  return null;
+};
+
+export interface SoulmateParams {
   birthDate: string;
   birthTime?: string;
   birthCity?: string;
   zodiacSign?: string;
   soulmateGender?: 'male' | 'female' | 'any';
-}): Promise<{ imageUri: string; description: string; isTextFallback?: boolean }> => {
+}
+
+// Generates just the portrait image (no token cost, no Gemini text call) —
+// used both by generateSoulmateImage() below and by the screen's "try
+// drawing again" retry, which must not re-charge tokens for a reading that
+// already succeeded once (only the free sketch service failed).
+// `variation` nudges the seed so a manual retry doesn't just refetch the
+// exact same request that already failed.
+export const generateSoulmatePortraitImage = async (
+  params: SoulmateParams,
+  variation = 0,
+): Promise<string> => {
+  const genderWord =
+    params.soulmateGender === 'female' ? 'feminine' :
+    params.soulmateGender === 'male' ? 'masculine' : 'androgynous';
+  const imgPrompt =
+    `mystical black and white pencil sketch portrait of a ${genderWord} soulmate, ` +
+    `single ethereal face, soft graphite shading, dreamy cosmic aura, fine art, ` +
+    `high contrast, portrait orientation${params.zodiacSign ? `, ${params.zodiacSign} energy` : ''}`;
+
+  // A deterministic seed keeps the same birth profile producing the same face.
+  let seed = 0;
+  const seedSrc = `${params.birthDate}|${params.birthCity || ''}|${params.soulmateGender || ''}`;
+  for (let i = 0; i < seedSrc.length; i++) seed = (Math.imul(31, seed) + seedSrc.charCodeAt(i)) | 0;
+  seed = (seed ^ (variation * 7919)) | 0; // deterministic per-attempt variation
+
+  const buildUrl = (prompt: string) =>
+    `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt)}` +
+    `?width=512&height=640&nologo=true&model=flux&seed=${Math.abs(seed)}`;
+
+  // Try the full mystical prompt with retries; if the free endpoint keeps
+  // failing, fall back once to a shorter, simpler prompt (occasionally more
+  // reliable on an overloaded shared server) before giving up gracefully.
+  let dataUri = await fetchImageWithRetry(buildUrl(imgPrompt), 3);
+  if (!dataUri) {
+    const simplePrompt = `black and white pencil sketch portrait of a ${genderWord} person, fine art, high contrast`;
+    dataUri = await fetchImageWithRetry(buildUrl(simplePrompt), 2);
+  }
+  return dataUri || '';
+};
+
+// Soulmate portrait — image generation with text fallback
+export const generateSoulmateImage = async (
+  params: SoulmateParams,
+): Promise<{ imageUri: string; description: string; isTextFallback?: boolean }> => {
   const genderHint =
     params.soulmateGender === 'female'
       ? 'The soulmate figure should be feminine in appearance.'
@@ -272,21 +354,7 @@ export const generateSoulmateImage = async (params: {
 
   const baseContext = `Born on ${params.birthDate}${params.birthTime ? ` at ${params.birthTime}` : ''}${params.birthCity ? ` in ${params.birthCity}` : ''}${params.zodiacSign ? ` (${params.zodiacSign})` : ''}. ${genderHint}`;
 
-  // ── Image: Pollinations.ai (free, keyless, returns an actual sketch) ─────────
-  // A deterministic seed keeps the same birth profile producing the same face.
-  const genderWord =
-    params.soulmateGender === 'female' ? 'feminine' :
-    params.soulmateGender === 'male' ? 'masculine' : 'androgynous';
-  const imgPrompt =
-    `mystical black and white pencil sketch portrait of a ${genderWord} soulmate, ` +
-    `single ethereal face, soft graphite shading, dreamy cosmic aura, fine art, ` +
-    `high contrast, portrait orientation${params.zodiacSign ? `, ${params.zodiacSign} energy` : ''}`;
-  let seed = 0;
-  const seedSrc = `${params.birthDate}|${params.birthCity || ''}|${params.soulmateGender || ''}`;
-  for (let i = 0; i < seedSrc.length; i++) seed = (Math.imul(31, seed) + seedSrc.charCodeAt(i)) | 0;
-  const imageUri =
-    `https://image.pollinations.ai/prompt/${encodeURIComponent(imgPrompt)}` +
-    `?width=512&height=640&nologo=true&model=flux&seed=${Math.abs(seed)}`;
+  const imageUri = await generateSoulmatePortraitImage(params);
 
   // ── Text: poetic portrait description via Gemini (best-effort) ───────────────
   let description = '';
@@ -303,5 +371,5 @@ Astrological profile: ${baseContext}`;
     if (__DEV__) console.warn('[Soulmate] text description failed:', (e as Error).message);
   }
 
-  return { imageUri, description };
+  return { imageUri, description, isTextFallback: !imageUri };
 };

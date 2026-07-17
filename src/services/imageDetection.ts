@@ -14,10 +14,25 @@ import ImageLabeling from '@react-native-ml-kit/image-labeling';
 
 export type Subject = 'face' | 'palm' | 'coffee';
 
+export type FaceLandmarkType =
+  | 'leftEar' | 'rightEar' | 'leftEye' | 'rightEye' | 'noseBase'
+  | 'leftCheek' | 'rightCheek' | 'mouthLeft' | 'mouthRight' | 'mouthBottom';
+
+export interface Point { x: number; y: number }
+
+export interface FaceGeometry {
+  /** Face bounding box, original-image pixel coords. */
+  frame: { top: number; left: number; width: number; height: number };
+  /** Named landmark points (only the ones ML Kit actually detected), original-image pixel coords. */
+  landmarks: Partial<Record<FaceLandmarkType, Point>>;
+  /** Full face outline contour (jaw → cheeks → forehead), original-image pixel coords. Ordered. */
+  faceContour: Point[];
+}
+
 export interface DetectionResult {
   accepted: boolean;
-  /** Face landmark points (original-image pixel coords) when a face is found — for overlay. */
-  landmarks?: { x: number; y: number }[];
+  /** Present only for subject === 'face' when a face was found — real geometry for overlay + shape analysis. */
+  faceGeometry?: FaceGeometry;
   /** Internal reason — useful for debugging / telemetry. */
   reason: string;
 }
@@ -55,13 +70,25 @@ const safeLabel = async (uri: string): Promise<RawLabel[] | null> => {
   }
 };
 
-const extractLandmarks = (face: any): { x: number; y: number }[] => {
+const extractFaceGeometry = (face: any): FaceGeometry => {
+  const landmarks: Partial<Record<FaceLandmarkType, Point>> = {};
   const lm = face?.landmarks;
-  if (!lm) return [];
-  return Object.values(lm)
-    .map((l: any) => l?.position)
+  if (lm) {
+    for (const key of Object.keys(lm) as FaceLandmarkType[]) {
+      const p = lm[key]?.position;
+      if (p && typeof p.x === 'number' && typeof p.y === 'number') {
+        landmarks[key] = { x: p.x, y: p.y };
+      }
+    }
+  }
+
+  const faceContour: Point[] = (face?.contours?.face?.points ?? [])
     .filter((p: any) => p && typeof p.x === 'number' && typeof p.y === 'number')
     .map((p: any) => ({ x: p.x, y: p.y }));
+
+  const frame = face?.frame ?? { top: 0, left: 0, width: 0, height: 0 };
+
+  return { frame, landmarks, faceContour };
 };
 
 // Decide based on labels alone (palm / coffee, and face fallback).
@@ -77,9 +104,13 @@ export const detectSubject = async (uri: string, subject: Subject): Promise<Dete
   // Face: the ML Kit face detector is the strongest, most reliable signal.
   if (subject === 'face') {
     try {
-      const faces = await FaceDetection.detect(uri, { performanceMode: 'fast', landmarkMode: 'all' });
+      const faces = await FaceDetection.detect(uri, {
+        performanceMode: 'accurate',
+        landmarkMode: 'all',
+        contourMode: 'all',
+      });
       if (faces && faces.length > 0) {
-        return { accepted: true, landmarks: extractLandmarks(faces[0]), reason: 'face-detected' };
+        return { accepted: true, faceGeometry: extractFaceGeometry(faces[0]), reason: 'face-detected' };
       }
       // No face from the detector — double-check via labels before rejecting.
       return decideByLabels(await safeLabel(uri), 'face');
